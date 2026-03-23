@@ -41,16 +41,6 @@ if [[ ! -e "$INPUT" ]]; then
     exit 1
 fi
 
-# --- Ensure Python deps ---
-
-ensure_deps() {
-    python3 -c "import riva.client" 2>/dev/null && return 0
-    echo "Installing nvidia-riva-client..."
-    pip3 install --quiet nvidia-riva-client
-}
-
-ensure_deps
-
 # --- Transcription engine (embedded Python) ---
 
 transcribe_file() {

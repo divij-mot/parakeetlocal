@@ -1,6 +1,6 @@
 # Transcribe
 
-A simple CLI tool for transcribing audio files with speaker diarization using NVIDIA's Parakeet CTC 1.1B model.
+A containerized CLI tool for transcribing audio files with speaker diarization using NVIDIA's Parakeet CTC 1.1B model. All dependencies (Python, ffmpeg, nvidia-riva-client) are prepackaged in the Docker image.
 
 ## Setup
 
@@ -11,22 +11,35 @@ A simple CLI tool for transcribing audio files with speaker diarization using NV
    export NVIDIA_API_KEY="your-key-here"
    ```
 
-3. Install Python dependency (auto-installed on first run, or manually):
+3. Build the Docker image:
    ```bash
-   pip3 install nvidia-riva-client
+   docker build -t transcribe .
    ```
 
 ## Usage
 
 ```bash
-# Transcribe a single file
-./transcribe recording.wav
+# Transcribe a single file (from current directory)
+docker run --rm -e NVIDIA_API_KEY -v "$(pwd):/data" transcribe recording.wav
 
 # Transcribe all audio files in a folder
-./transcribe ./my-recordings/
+docker run --rm -e NVIDIA_API_KEY -v "$(pwd):/data" transcribe ./my-recordings/
 ```
 
 Output `.txt` files are created alongside the input audio files with the same name.
+
+### Shell alias (optional)
+
+Add this to your `.bashrc` / `.zshrc` for convenience:
+```bash
+alias transcribe='docker run --rm -e NVIDIA_API_KEY -v "$(pwd):/data" transcribe'
+```
+
+Then just:
+```bash
+transcribe recording.wav
+transcribe ./my-recordings/
+```
 
 ## Supported Formats
 
