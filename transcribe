@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+#
+# transcribe - Transcribe audio files with speaker diarization using NVIDIA Parakeet CTC 1.1B
+#
+# Usage:
+#   transcribe <file_or_folder>
+#
+# Environment:
+#   NVIDIA_API_KEY - Your build.nvidia.com API key
+#
+# Outputs .txt files alongside (or in same structure as) the input audio files.
+
+set -euo pipefail
+
+NVIDIA_GRPC_SERVER="grpc.nvcf.nvidia.com:443"
+NVIDIA_FUNCTION_ID="1598d209-5e27-4d3c-8079-4751568b1081"
+
+# --- Preflight checks ---
+
+if ! command -v ffmpeg &>/dev/null; then
+    echo "Error: ffmpeg is required. Install with: brew install ffmpeg"
+    exit 1
+fi
+
+if [[ -z "${NVIDIA_API_KEY:-}" ]]; then
+    echo "Error: NVIDIA_API_KEY environment variable is not set."
+    echo "Get your key from https://build.nvidia.com and run:"
+    echo "  export NVIDIA_API_KEY=\"your-key-here\""
+    exit 1
+fi
+
+if [[ $# -ne 1 ]]; then
+    echo "Usage: transcribe <audio_file_or_folder>"
+    exit 1
+fi
+
+INPUT="$1"
+
+if [[ ! -e "$INPUT" ]]; then
+    echo "Error: '$INPUT' does not exist."
+    exit 1
+fi
+
+# --- Ensure Python deps ---
+
+ensure_deps() {
+    python3 -c "import riva.client" 2>/dev/null && return 0
+    echo "Installing nvidia-riva-client..."
+    pip3 install --quiet nvidia-riva-client
+}
+
+ensure_deps
+
+# --- Transcription engine (embedded Python) ---
+
+transcribe_file() {
+    local audio_path="$1"
+    local output_path="$2"
+
+    # Convert to 16kHz mono WAV for the API (handles m4a, mp3, etc.)
+    local tmp_wav=""
+    local ext="${audio_path##*.}"
+    ext="$(echo "$ext" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$ext" != "wav" ]]; then
+        tmp_wav="$(mktemp /tmp/transcribe_XXXXXX.wav)"
+        ffmpeg -y -i "$audio_path" -ar 16000 -ac 1 -sample_fmt s16 "$tmp_wav" -loglevel error
+        audio_path="$tmp_wav"
+    fi
+
+    python3 - "$audio_path" "$output_path" "$NVIDIA_GRPC_SERVER" "$NVIDIA_FUNCTION_ID" "$NVIDIA_API_KEY" <<'PYTHON_SCRIPT'
+import sys
+import io
+import riva.client
+
+audio_path = sys.argv[1]
+output_path = sys.argv[2]
+server = sys.argv[3]
+function_id = sys.argv[4]
+api_key = sys.argv[5]
+
+# Connect to NVIDIA cloud API with SSL and auth
+metadata = [
+    ("function-id", function_id),
+    ("authorization", f"Bearer {api_key}"),
+]
+auth = riva.client.Auth(
+    uri=server,
+    use_ssl=True,
+    metadata_args=metadata,
+)
+asr_service = riva.client.ASRService(auth)
+
+# Read audio
+with io.open(audio_path, "rb") as f:
+    audio_content = f.read()
+
+# Configure recognition
+config = riva.client.RecognitionConfig(
+    language_code="en-US",
+    max_alternatives=1,
+    enable_automatic_punctuation=True,
+    enable_word_time_offsets=True,
+)
+
+# Enable speaker diarization (uses sortformer on the server)
+riva.client.asr.add_speaker_diarization_to_config(config, diarization_enable=True, diarization_max_speakers=10)
+
+# Transcribe
+response = asr_service.offline_recognize(audio_content, config)
+
+# Format output with speaker paragraphs
+lines = []
+current_speaker = None
+current_words = []
+
+for result in response.results:
+    if not result.alternatives:
+        continue
+    for word_info in result.alternatives[0].words:
+        tag = word_info.speaker_tag
+        w = word_info.word
+
+        if current_speaker is None:
+            current_speaker = tag
+            current_words = [w]
+        elif tag != current_speaker:
+            # Flush current speaker's paragraph
+            lines.append(f"[Speaker {current_speaker}]")
+            lines.append(" ".join(current_words))
+            lines.append("")
+            current_speaker = tag
+            current_words = [w]
+        else:
+            current_words.append(w)
+
+# Flush last speaker
+if current_words:
+    lines.append(f"[Speaker {current_speaker}]")
+    lines.append(" ".join(current_words))
+    lines.append("")
+
+output_text = "\n".join(lines)
+
+with open(output_path, "w") as f:
+    f.write(output_text)
+
+print(f"  -> {output_path}")
+PYTHON_SCRIPT
+
+    # Clean up temp wav
+    [[ -n "$tmp_wav" && -f "$tmp_wav" ]] && rm -f "$tmp_wav"
+}
+
+# --- Process input ---
+
+AUDIO_EXTENSIONS=("wav" "flac" "ogg" "opus" "mp3" "m4a" "wma" "aac" "webm")
+
+is_audio() {
+    local ext="${1##*.}"
+    ext="$(echo "$ext" | tr '[:upper:]' '[:lower:]')"
+    for e in "${AUDIO_EXTENSIONS[@]}"; do
+        [[ "$ext" == "$e" ]] && return 0
+    done
+    return 1
+}
+
+if [[ -f "$INPUT" ]]; then
+    # Single file
+    base="${INPUT%.*}"
+    out="${base}.txt"
+    echo "Transcribing: $INPUT"
+    transcribe_file "$INPUT" "$out"
+
+elif [[ -d "$INPUT" ]]; then
+    # Folder — find all audio files
+    count=0
+    while IFS= read -r -d '' file; do
+        if is_audio "$file"; then
+            base="${file%.*}"
+            out="${base}.txt"
+            echo "Transcribing: $file"
+            transcribe_file "$file" "$out"
+            ((count++))
+        fi
+    done < <(find "$INPUT" -type f -print0)
+
+    if [[ $count -eq 0 ]]; then
+        echo "No audio files found in '$INPUT'."
+        exit 1
+    fi
+    echo "Done. Transcribed $count file(s)."
+else
+    echo "Error: '$INPUT' is not a file or directory."
+    exit 1
+fi
